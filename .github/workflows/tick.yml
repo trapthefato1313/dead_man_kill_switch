@@ -1,0 +1,38 @@
+name: tick redundante
+
+# O worker local e este workflow correm a mesma avaliacao (POST /api/tick).
+# Se o servidor onde vive o worker cair, ainda ha alguem a avaliar o switch.
+# Se este workflow falhar, o worker local continua.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate
+        env:
+          DMKS_URL: ${{ secrets.DMKS_URL }}
+          DMKS_TICK_TOKEN: ${{ secrets.DMKS_TICK_TOKEN }}
+        run: |
+          if [ -z "$DMKS_URL" ] || [ -z "$DMKS_TICK_TOKEN" ]; then
+            echo "DMKS_URL e DMKS_TICK_TOKEN nao configurados; a sair sem Evaluate."
+            exit 0
+          fi
+          curl --silent --show-error --fail --max-time 60 \
+               --retry 3 --retry-delay 10 \
+               -X POST "$DMKS_URL/api/tick" \
+               -H "Authorization: Bearer $DMKS_TICK_TOKEN" \
+               -H "Content-Type: application/json" \
+               --data '{}' \
+               | tee /tmp/tick.json
+          echo
+          python3 -c "
+import json, sys
+summary = json.load(open('/tmp/tick.json'))
+for switch in summary.get('switches', []):
+    print(switch['switch'], '->', switch['state'])
+"

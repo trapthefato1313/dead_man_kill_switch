@@ -1,0 +1,10 @@
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.gpg
+config.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
