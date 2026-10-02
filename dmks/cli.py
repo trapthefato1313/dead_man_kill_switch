@@ -60,13 +60,13 @@ def cmd_init(args) -> int:
     cfg.server.smtp_host = args.smtp_host
     cfg.server.smtp_port = args.smtp_port
     cfg.server.smtp_from = args.smtp_from
-    cfg.server.webhook_url = args.webhook_url
+    cfg.server.webhook_urls = list(args.webhook_urls or [])
     cfg.server.publish_dir = args.publish_dir
 
     switch = config_mod.SwitchConfig(
         name=args.name,
         warn_after=args.warn_days * config_mod.DAY,
-        arm_after=args.arm_days * config_mod.DAY,
+        arm_after=None if args.arm_days is None else args.arm_days * config_mod.DAY,
         release_after=args.release_days * config_mod.DAY,
         release_mode=args.release_mode,
     )
@@ -498,7 +498,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--switch", default="main")
     p.add_argument("--name", default="principal")
     p.add_argument("--warn-days", type=int, default=7)
-    p.add_argument("--arm-days", type=int, default=14)
+    p.add_argument("--arm-days", type=int, default=None,
+                   help="second deadline; omit it to derive the midpoint")
     p.add_argument("--release-days", type=int, default=30)
     p.add_argument("--release-mode", choices=config_mod.RELEASE_MODES, default="hold")
     p.add_argument("--owner-email")
@@ -508,7 +509,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smtp-host")
     p.add_argument("--smtp-port", type=int, default=587)
     p.add_argument("--smtp-from")
-    p.add_argument("--webhook-url")
+    p.add_argument("--webhook-url", action="append", dest="webhook_urls",
+                   metavar="URL",
+                   help="repeatable: every URL gets the packet, independently")
     p.add_argument("--publish-dir")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)

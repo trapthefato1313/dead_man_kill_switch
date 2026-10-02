@@ -158,11 +158,78 @@ a estar vivo tem sempre de ser mais rápido do que parecer estar morto.
 `dmks cancel --switch main --secret "$DMKS_OWNER_SECRET"` aborta a escalada a
 partir de qualquer lado, com o secret do dono.
 
+### Dois prazos em vez de três
+
+Bastam dois prazos para o sistema funcionar. O estado `armed` existe como rede
+de segurança, não comoobrigação: se não disseres nada, ele é calculado a meio.
+
+```bash
+python3 -m dmks init --warn-days 5 --release-days 20    # armed = dia 12
+```
+
+Com os dois prazos acima o sistema avisa-te no dia 5, insiste todos os dias a
+partir do dia 12, e entrega no dia 20. O valor calculado fica gravado no
+disco, para o motor nunca ter de adivinhar.
+
 ## Modos de entrega
 
 - `hold` (omissão) — regista tudo, não envia nada. É o modo de ensaio.
 - `notify` — email (SMTP) ou webhook com o pacote cifrado em anexo/base64.
 - `publish` — copia o `.gpg` e um manifesto para `publish_dir`.
+
+### Todos os canais recebem, não só o primeiro
+
+Com SMTP e webhook configurados, o pacote sai por **ambos**. Se um falhar, o
+outro continua a receber, a entrega só é marcada como feita quando todos
+confirmam, e o canal que falhou é o único retomado na tentativa seguinte.
+
+```bash
+python3 -m dmks init \
+  --smtp-host smtp.protonmail.ch --smtp-port 587 \
+  --smtp-from eu@exemplo.pt --smtp-user eu@exemplo.pt \
+  --webhook-url https://servico-a.example/hook \
+  --webhook-url https://servico-b.example/hook \
+  --release-mode notify
+```
+
+`--webhook-url` repete-se. Isto substituiu uma versão anterior que devolvia na
+primeiratransporta que funcionasse — o que na prática significava a prova acabar
+num sítio só, exactamente o que um switch não deve fazer.
+
+### Email a partir do Proton Mail
+
+O Proton não tem SMTP aberto. Só existem dois caminhos, e ambos exigem plano
+pago:
+
+| Caminho | Host | Credencial | Quando |
+|---|---|---|---|
+| SMTP Submission | `smtp.protonmail.ch:587` | SMTP token | plano pago **e domínio próprio** |
+| Proton Mail Bridge | `127.0.0.1:1025` | Bridge password | plano pago, corre no teu máquina |
+
+No plano gratuito não há saída por SMTP. O endereço `@proton.me` simplesmente
+não pode ser remetido por um programa.
+
+Com SMTP Submission, o token gera-se em Definições → Todas as definições →
+IMAP/SMTP → SMTP tokens, e vai no `--smtp-password`:
+
+```bash
+python3 -m dmks init \
+  --smtp-host smtp.protonmail.ch --smtp-port 587 \
+  --smtp-from eu@meudominio.pt --smtp-user eu@meudominio.pt \
+  --smtp-password "$TOKEN_SMTP" --release-mode notify
+```
+
+STARTTLS vem ligado, que é o que o Proton espera na 587.
+
+**Sobre o Bridge:** ele corre no teu computador, o que significa que se o
+computador estiver fechado quando o switch dispara, o pacote não sai. Para um
+sistema que tem de funcionar sem ti, isso é um ponto único de falha. SMTP
+Submission não tem o problema. Se ficares preso ao Bridge, coloca-o num
+servidor teu em vez do portátil.
+
+Se nenhum dos dois for possível, a alternativa honesta é um relay SMTP neutro
+(Resend, Postmark, SES). Email é email; o que interessa é que exista mais do que
+uma rota de saída.
 
 ## Limites, ditos com todas as letras
 
@@ -170,6 +237,9 @@ partir de qualquer lado, com o secret do dono.
   nada a fazer. É a razão de existirem as cópias redundantes.
 - **Um atacante com o teu secret pode manter o switch quieto.** É o preço de
   não depender de bateria. Mitiga com quorum `all` e vários aparelhos.
+- **Um canal de saída é um ponto único de falha.** Se só configurares um, e ele
+  deixar de funcionar ou decidir engolir o pacote em silêncio, a prova está
+  perdida mesmo que o sistema reporte sucesso. Configura pelo menos dois.
 - **O formato OpenPGP tem data de validade.** As chaves que o GnuPG gera por
   omissão expiram. Para uma chave de longa vida, gera-a com
   `gpg --quick-generate-key "Advogado <adv@exemplo.pt>" default default never`

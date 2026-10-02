@@ -114,41 +114,97 @@ class WebhookTransport:
 
 
 @dataclass
-class CompositeTransport:
-    transports: list[Transport]
+class Channel:
+    """One named route out. Every channel is attempted, never just the first."""
+
+    name: str
+    transport: Transport
 
     def send(self, target: dict, subject: str, body: str, attachment: Path | None = None) -> None:
-        errors = []
-        for transport in self.transports:
+        self.transport.send(target, subject, body, attachment)
+
+
+@dataclass
+class FanOut:
+    """Sends to every channel and reports each result separately.
+
+    A dead man's switch must not depend on one route: if the only channel is
+    silently swallowed by the receiving service, the evidence is gone. So all
+    channels get the packet, and the target only counts as delivered when all
+    of them confirmed it.
+    """
+
+    channels: list[Channel]
+
+    def deliver(
+        self,
+        target: dict,
+        subject: str,
+        body: str,
+        attachment: Path | None = None,
+        only: set[str] | None = None,
+    ) -> dict[str, str | None]:
+        results: dict[str, str | None] = {}
+        for channel in self.channels:
+            if only is not None and channel.name not in only:
+                continue
             try:
-                transport.send(target, subject, body, attachment)
-                return
-            except Exception as exc:  # noqa: BLE001 - one broken channel must not hide the others
-                errors.append(f"{type(transport).__name__}: {exc}")
-        raise TransportError("; ".join(errors))
+                channel.send(target, subject, body, attachment)
+                results[channel.name] = None
+            except Exception as exc:  # noqa: BLE001 - recorded per channel, retried, never fatal
+                results[channel.name] = f"{type(channel.transport).__name__}: {exc}"
+        return results
+
+
+def _send_all(
+    transport: Transport,
+    target: dict,
+    subject: str,
+    body: str,
+    attachment: Path | None = None,
+    only: set[str] | None = None,
+) -> dict[str, str | None]:
+    """Every outstanding channel is attempted. Returns channel -> error.
+
+    `only` exists so a retry never re-sends through a route that already took
+    the packet. Accepts a plain single-channel transport too, so tests and the
+    NullTransport keep working unchanged.
+    """
+    if isinstance(transport, FanOut):
+        return transport.deliver(target, subject, body, attachment, only=only)
+    if only is not None and "default" not in only:
+        return {}
+    try:
+        transport.send(target, subject, body, attachment)
+    except Exception as exc:  # noqa: BLE001
+        return {"default": f"{type(transport).__name__}: {exc}"}
+    return {"default": None}
 
 
 def build_transport(cfg: Config, override: Transport | None = None) -> Transport:
     if override is not None:
         return override
     server = cfg.server
-    transports: list[Transport] = []
+    channels: list[Channel] = []
     if server.smtp_host and server.smtp_from:
-        transports.append(
-            SmtpTransport(
-                host=server.smtp_host,
-                port=server.smtp_port,
-                sender=server.smtp_from,
-                user=server.smtp_user,
-                password=server.smtp_password,
-                starttls=server.smtp_starttls,
+        channels.append(
+            Channel(
+                name="smtp",
+                transport=SmtpTransport(
+                    host=server.smtp_host,
+                    port=server.smtp_port,
+                    sender=server.smtp_from,
+                    user=server.smtp_user,
+                    password=server.smtp_password,
+                    starttls=server.smtp_starttls,
+                ),
             )
         )
-    if server.webhook_url:
-        transports.append(WebhookTransport(server.webhook_url))
-    if not transports:
+    for index, url in enumerate(server.all_webhook_urls()):
+        channels.append(Channel(name=f"webhook:{index}", transport=WebhookTransport(url)))
+    if not channels:
         return NullTransport()
-    return CompositeTransport(transports)
+    return FanOut(channels)
 
 
 def due(row: sqlite3.Row, now: int) -> bool:
@@ -189,14 +245,22 @@ def deliver_packet(
     outcomes: list[dict] = []
     for target in recipients:
         label = target.get("address", "")
-        if store.delivered_before(conn, switch["id"], packet["id"], label, "release"):
-            outcomes.append({"target": label, "skipped": "already_delivered"})
+        already = store.delivered_channels(conn, switch["id"], packet["id"], label, "release")
+        outstanding = [
+            name for name in _channel_names(transport) if name not in already
+        ]
+        if not outstanding:
+            outcomes.append({"target": label, "skipped": "already_delivered", "channels": sorted(already)})
             continue
 
         if problems:
             error = "; ".join(problems)
             with store.tx(conn):
                 store.record_delivery(conn, switch["id"], packet["id"], label, "release", False, now, error)
+                for name in outstanding:
+                    store.record_delivery(
+                        conn, switch["id"], packet["id"], label, "release", False, now, error, channel=name
+                    )
                 audit.append(
                     conn, audit_key, now, "delivery_refused",
                     {"switch": switch["id"], "packet": packet["id"], "target": label, "problems": problems},
@@ -204,32 +268,53 @@ def deliver_packet(
             outcomes.append({"target": label, "ok": False, "error": error})
             continue
 
-        try:
-            transport.send(
-                target,
-                f"[dead man's switch] {switch['name']}: pacote selado {packet['id']}",
-                _release_body(switch, packet),
-                attachment=path,
-            )
-        except Exception as exc:  # noqa: BLE001 - recorded and retried, never fatal
-            with store.tx(conn):
-                store.record_delivery(conn, switch["id"], packet["id"], label, "release", False, now, str(exc))
-            outcomes.append({"target": label, "ok": False, "error": str(exc)})
-            continue
-
+        results = _send_all(
+            transport,
+            target,
+            f"[dead man's switch] {switch['name']}: pacote selado {packet['id']}",
+            _release_body(switch, packet),
+            attachment=path,
+            only=set(outstanding),
+        )
+        # Delivered only when every outstanding channel confirmed, and only if
+        # every outstanding channel was actually reached.
+        all_ok = (
+            bool(results)
+            and set(results) == set(outstanding)
+            and all(err is None for err in results.values())
+        )
         with store.tx(conn):
-            store.record_delivery(conn, switch["id"], packet["id"], label, "release", True, now)
-            audit.append(
-                conn, audit_key, now, "delivered",
-                {"switch": switch["id"], "packet": packet["id"], "target": label,
-                 "sha256": packet["sha256"], "mode": switch["release_mode"]},
+            for name, err in results.items():
+                store.record_delivery(
+                    conn, switch["id"], packet["id"], label, "release", err is None, now, err, channel=name
+                )
+            store.record_delivery(
+                conn, switch["id"], packet["id"], label, "release", all_ok, now,
+                None if all_ok else "; ".join(e for e in results.values() if e) or None,
             )
-        outcomes.append({"target": label, "ok": True})
+            if all_ok:
+                audit.append(
+                    conn, audit_key, now, "delivered",
+                    {"switch": switch["id"], "packet": packet["id"], "target": label,
+                     "sha256": packet["sha256"], "mode": switch["release_mode"],
+                     "channels": sorted(results)},
+                )
+        outcomes.append(
+            {"target": label, "ok": all_ok,
+             "channels": {name: ("sent" if err is None else err) for name, err in results.items()}}
+        )
 
     if switch["release_mode"] == "publish":
         outcomes.append(publish(cfg, switch, packet))
 
     return outcomes
+
+
+def _channel_names(transport: Transport) -> list[str]:
+    channels = getattr(transport, "channels", None)
+    if isinstance(channels, list):
+        return [c.name for c in channels]
+    return ["default"]
 
 
 def _release_body(switch: sqlite3.Row, packet: sqlite3.Row) -> str:
@@ -312,10 +397,9 @@ def notify(
         return False
     failures = []
     for target in targets:
-        try:
-            transport.send(target, subject, body)
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"{target.get('address')}: {exc}")
+        for channel, error in _send_all(transport, target, subject, body).items():
+            if error:
+                failures.append(f"{target.get('address')} via {channel}: {error}")
     ok = not failures
     with store.tx(conn):
         store.record_notice(conn, switch["id"], kind, bucket, ok, now, "; ".join(failures) or None)

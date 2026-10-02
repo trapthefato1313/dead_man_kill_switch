@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -97,11 +97,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
     packet_id  TEXT NOT NULL,
     target     TEXT NOT NULL,
     mode       TEXT NOT NULL,
+    channel    TEXT NOT NULL DEFAULT '',
     ok         INTEGER NOT NULL,
     attempts   INTEGER NOT NULL DEFAULT 1,
     last_error TEXT,
     at         INTEGER NOT NULL,
-    UNIQUE(switch_id, packet_id, target, mode)
+    UNIQUE(switch_id, packet_id, target, mode, channel)
 );
 
 CREATE TABLE IF NOT EXISTS notices (
@@ -134,8 +135,48 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     _set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     return conn
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """v1 -> v2: deliveries gains a per-channel column.
+
+    The UNIQUE constraint changed too, which SQLite cannot alter in place, so
+    the table is rebuilt. Pre-v2 rows carry channel '' and stay delivered.
+    """
+    if "channel" in _columns(conn, "deliveries"):
+        return
+    conn.executescript(
+        """
+        BEGIN IMMEDIATE;
+        ALTER TABLE deliveries RENAME TO deliveries_v1;
+        CREATE TABLE deliveries (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            switch_id  TEXT NOT NULL,
+            packet_id  TEXT NOT NULL,
+            target     TEXT NOT NULL,
+            mode       TEXT NOT NULL,
+            channel    TEXT NOT NULL DEFAULT '',
+            ok         INTEGER NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 1,
+            last_error TEXT,
+            at         INTEGER NOT NULL,
+            UNIQUE(switch_id, packet_id, target, mode, channel)
+        );
+        INSERT INTO deliveries(switch_id, packet_id, target, mode, channel,
+                               ok, attempts, last_error, at)
+        SELECT switch_id, packet_id, target, mode, '', ok, attempts, last_error, at
+          FROM deliveries_v1;
+        DROP TABLE deliveries_v1;
+        COMMIT;
+        """
+    )
 
 
 class tx:
@@ -194,6 +235,17 @@ def advance_watermark(conn: sqlite3.Connection, now: int) -> None:
     return watermark
 
 
+def _resolve_arm(warn: int, arm: int | None, release: int) -> int:
+    """Two deadlines are enough: the armed step is the midpoint.
+
+    Stored explicitly so the engine never has to guess and the value that
+    actually governs the state machine is the one on disk.
+    """
+    if arm is not None:
+        return arm
+    return warn + max(1, (release - warn) // 2)
+
+
 def create_switch(
     conn: sqlite3.Connection,
     switch_id: str,
@@ -217,7 +269,7 @@ def create_switch(
         name,
         now,
         thresholds["warn_after"],
-        thresholds["arm_after"],
+        _resolve_arm(thresholds["warn_after"], thresholds["arm_after"], thresholds["release_after"]),
         thresholds["release_after"],
         thresholds["device_grace"],
         thresholds["quorum_mode"],
@@ -381,14 +433,32 @@ def get_packet(conn: sqlite3.Connection, packet_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM packets WHERE id=?", (packet_id,)).fetchone()
 
 
-def delivered_before(conn: sqlite3.Connection, switch_id: str, packet_id: str, target: str, mode: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM deliveries WHERE switch_id=? AND packet_id=? AND target=? AND mode=? AND ok=1",
+def delivered_before(
+    conn: sqlite3.Connection,
+    switch_id: str,
+    packet_id: str,
+    target: str,
+    mode: str,
+    channel: str | None = None,
+) -> bool:
+    """channel=None means 'through any channel'; a str pins one channel."""
+    sql = "SELECT 1 FROM deliveries WHERE switch_id=? AND packet_id=? AND target=? AND mode=? AND ok=1"
+    args: list[object] = [switch_id, packet_id, target, mode]
+    if channel is not None:
+        sql += " AND channel=?"
+        args.append(channel)
+    return conn.execute(sql, args).fetchone() is not None
+
+
+def delivered_channels(conn: sqlite3.Connection, switch_id: str, packet_id: str, target: str, mode: str) -> set[str]:
+    return {
+        r["channel"]
+        for r in conn.execute(
+            "SELECT DISTINCT channel FROM deliveries "
+            "WHERE switch_id=? AND packet_id=? AND target=? AND mode=? AND ok=1",
             (switch_id, packet_id, target, mode),
-        ).fetchone()
-        is not None
-    )
+        )
+    }
 
 
 def record_delivery(
@@ -400,13 +470,14 @@ def record_delivery(
     ok: bool,
     now: int,
     error: str | None = None,
+    channel: str = "",
 ) -> None:
     conn.execute(
-        "INSERT INTO deliveries(switch_id, packet_id, target, mode, ok, attempts, last_error, at) "
-        "VALUES(?,?,?,?,?,1,?,?) "
-        "ON CONFLICT(switch_id, packet_id, target, mode) DO UPDATE SET "
+        "INSERT INTO deliveries(switch_id, packet_id, target, mode, channel, ok, attempts, last_error, at) "
+        "VALUES(?,?,?,?,?,?,1,?,?) "
+        "ON CONFLICT(switch_id, packet_id, target, mode, channel) DO UPDATE SET "
         "ok=excluded.ok, attempts=deliveries.attempts+1, last_error=excluded.last_error, at=excluded.at",
-        (switch_id, packet_id, target, mode, 1 if ok else 0, error, now),
+        (switch_id, packet_id, target, mode, channel, 1 if ok else 0, error, now),
     )
 
 

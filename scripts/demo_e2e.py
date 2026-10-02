@@ -145,7 +145,7 @@ def main() -> int:
         if evaluation["state"] != "ok":
             raise SystemExit("o quorum 'all' devia ter bloqueado a escalada")
 
-        step(8, "os doisDevices param: a escalada percorre warn -> armed -> release")
+        step(8, "os dois dispositivos param: a escalada percorre warn -> armed -> release")
         backdate(data, start, device="phone")
         moment = start
         for index in range(120):

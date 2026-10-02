@@ -24,7 +24,12 @@ RELEASE_MODES = ("hold", "notify", "publish")
 class SwitchConfig:
     name: str
     warn_after: int = 7 * DAY
-    arm_after: int = 14 * DAY
+
+    # Optional: the owner may express the switch as just two deadlines. When
+    # left unset the armed deadline is derived as the midpoint, so the third
+    # escalation step still exists as a safety net.
+    arm_after: int | None = 14 * DAY
+
     release_after: int = 30 * DAY
 
     # A device must be silent for at least this long before it is allowed to
@@ -53,7 +58,10 @@ class ServerConfig:
     port: int = 8770
     tick_seconds: int = 3600
 
-    # Delivery. Exactly one of smtp_* / webhook_url is needed for "notify".
+    # Delivery. At least one of smtp_* / webhook_urls is needed for "notify".
+    # Proton Mail SMTP Submission: smtp.protonmail.ch:587, STARTTLS, and the
+    # "password" is an SMTP token from the account settings, not the account
+    # password. Only available on paid plans with a custom domain.
     smtp_host: str | None = None
     smtp_port: int = 587
     smtp_user: str | None = None
@@ -62,8 +70,22 @@ class ServerConfig:
     smtp_starttls: bool = True
 
     webhook_url: str | None = None
+    webhook_urls: list[str] = field(default_factory=list)
 
     owner_email: str | None = None
+
+    def all_webhook_urls(self) -> list[str]:
+        """Every configured webhook, de-duplicated, legacy field included."""
+        urls = [*self.webhook_urls]
+        if self.webhook_url:
+            urls.insert(0, self.webhook_url)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                unique.append(url)
+        return unique
 
     # Directory that becomes public when release_mode == "publish".
     publish_dir: str | None = None
@@ -134,10 +156,11 @@ def validate(cfg: Config) -> list[str]:
     """Return a list of configuration problems. Empty means valid."""
     problems: list[str] = []
     for sid, sw in cfg.switches.items():
-        if not (0 < sw.warn_after < sw.arm_after < sw.release_after):
+        arm = resolve_arm(sw)
+        if not (0 < sw.warn_after < arm < sw.release_after):
             problems.append(
                 f"{sid}: thresholds must be strictly increasing, got "
-                f"warn={sw.warn_after} arm={sw.arm_after} release={sw.release_after}"
+                f"warn={sw.warn_after} arm={arm} release={sw.release_after}"
             )
         if sw.quorum_mode == "all":
             if not sw.recipients:
@@ -155,9 +178,16 @@ def validate(cfg: Config) -> list[str]:
             if not sw.recipients:
                 problems.append(f"{sid}: release_mode {sw.release_mode!r} needs recipients")
         if sw.release_mode == "notify" and not (
-            cfg.server.smtp_host or cfg.server.webhook_url
+            cfg.server.smtp_host or cfg.server.all_webhook_urls()
         ):
-            problems.append(f"{sid}: release_mode 'notify' needs smtp_host or webhook_url")
+            problems.append(f"{sid}: release_mode 'notify' needs smtp_host or a webhook_url")
         if sw.release_mode == "publish" and not cfg.server.publish_dir:
             problems.append(f"{sid}: release_mode 'publish' needs server.publish_dir")
     return problems
+
+
+def resolve_arm(sw: SwitchConfig) -> int:
+    """The armed deadline, derived when the owner only gave two deadlines."""
+    if sw.arm_after is not None:
+        return sw.arm_after
+    return sw.warn_after + max(1, (sw.release_after - sw.warn_after) // 2)
