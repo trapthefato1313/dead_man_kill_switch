@@ -95,17 +95,50 @@ def would_be_state(switch: sqlite3.Row, silence: int) -> str:
 
 
 def evaluate(
-    conn: sqlite3.Connection, audit_key: bytes, switch_id: str, now: int
+    conn: sqlite3.Connection,
+    audit_key: bytes,
+    switch_id: str,
+    now: int,
+    max_credit: int = 3 * 86400,
+    corroborated: bool = False,
+    clock_ok: bool = True,
 ) -> Evaluation:
     switch = store.get_switch(conn, switch_id)
     if switch is None:
         raise KeyError(switch_id)
 
-    effective_now = store.advance_watermark(conn, now)
     notes: list[str] = []
-    if effective_now != now:
+
+    # Fail-secure: when the clock cannot be trusted, the irreversible step does
+    # not happen at all. We stay exactly where we are and the caller is expected
+    # to alert the owner, who is alive and can fix it.
+    if not clock_ok:
+        last_trusted = store.clock_watermark(conn) or now
+        notes.append(
+            "clock_untrusted: clocks disagree, escalation refused, state left unchanged"
+        )
+        return Evaluation(
+            switch_id=switch_id,
+            state=switch["state"],
+            previous_state=switch["state"],
+            silenced_for=silenced_for(conn, switch, last_trusted),
+            would_be_state=switch["state"],
+            confirmations=0,
+            escalated=False,
+            notes=notes,
+        )
+
+    effective_now, discarded = store.credit_time(
+        conn, now, max_credit, corroborated, reference=switch["created_at"]
+    )
+    if now < effective_now:
         notes.append(
             f"clock_regression_ignored: server={now} watermark={effective_now}, using watermark"
+        )
+    if discarded:
+        notes.append(
+            f"clock_jump_capped: wanted {discarded}s more than one evaluation may credit "
+            f"without corroboration, crediting at most {max_credit}s per tick instead"
         )
 
     previous = switch["state"]
@@ -200,8 +233,18 @@ def evaluate(
     )
 
 
-def tick_all(conn: sqlite3.Connection, audit_key: bytes, now: int) -> list[Evaluation]:
-    return [evaluate(conn, audit_key, row["id"], now) for row in store.list_switches(conn)]
+def tick_all(
+    conn: sqlite3.Connection,
+    audit_key: bytes,
+    now: int,
+    max_credit: int = 3 * 86400,
+    corroborated: bool = False,
+    clock_ok: bool = True,
+) -> list[Evaluation]:
+    return [
+        evaluate(conn, audit_key, row["id"], now, max_credit, corroborated, clock_ok)
+        for row in store.list_switches(conn)
+    ]
 
 
 def status(conn: sqlite3.Connection, switch_id: str, now: int) -> dict:

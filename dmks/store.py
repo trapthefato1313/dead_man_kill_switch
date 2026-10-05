@@ -226,15 +226,6 @@ def clock_watermark(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def advance_watermark(conn: sqlite3.Connection, now: int) -> None:
-    """Move the watermark forward only. Returns the effective clock."""
-    watermark = clock_watermark(conn)
-    if now > watermark:
-        set_meta(conn, "clock_watermark", str(now))
-        return now
-    return watermark
-
-
 def _resolve_arm(warn: int, arm: int | None, release: int) -> int:
     """Two deadlines are enough: the armed step is the midpoint.
 
@@ -244,6 +235,48 @@ def _resolve_arm(warn: int, arm: int | None, release: int) -> int:
     if arm is not None:
         return arm
     return warn + max(1, (release - warn) // 2)
+
+
+def credit_time(
+    conn: sqlite3.Connection,
+    observed: int,
+    max_credit: int,
+    corroborated: bool = False,
+    reference: int | None = None,
+) -> tuple[int, int | None]:
+    """Advance trusted time by at most `max_credit`, returning (now, discarded).
+
+    The watermark stores *credited* time, not observed time. That distinction is
+    the whole fix: if it stored observed time, a single large jump would push it
+    decades into the future and the next tick would credit all of it.
+
+    A backwards clock yields the watermark unchanged and discards nothing: the
+    regression is simply not real time. A forwards jump is capped unless a
+    second clock corroborated it, so a ten-year NTP step cannot turn into ten
+    years of silence. Real downtime is still caught, just over several
+    evaluations instead of one.
+
+    `reference` anchors the very first reading to when the switch was created.
+    Without it a fresh database would adopt a badly wrong clock without
+    complaint, and the switch could never have more history than its own life.
+    """
+    raw = get_meta(conn, "clock_watermark")
+    if raw is None:
+        base = observed if reference is None else int(reference)
+        adopted = observed if corroborated else min(observed, base + max_credit)
+        set_meta(conn, "clock_watermark", str(adopted))
+        return adopted, (observed - adopted) or None
+    watermark = int(raw)
+    if observed <= watermark:
+        return watermark, None
+    delta = observed - watermark
+    if corroborated:
+        credited = delta
+    else:
+        credited = min(delta, max_credit)
+    effective = watermark + credited
+    set_meta(conn, "clock_watermark", str(effective))
+    return effective, delta - credited or None
 
 
 def create_switch(

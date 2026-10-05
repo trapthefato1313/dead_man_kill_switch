@@ -49,6 +49,16 @@ class SwitchConfig:
     # Accept check-in timestamps this far off server time.
     clock_skew: int = 300
 
+    # How much elapsed time one evaluation may credit when no second clock has
+    # corroborated it. A 10-year NTP step can therefore never become 10 years of
+    # silence. Real downtime is still caught, over several evaluations.
+    max_credit: int = 3 * DAY
+
+    # Independent hosts polled for their HTTP Date header. Empty means no
+    # corroboration is available and max_credit always applies.
+    time_sources: list[str] = field(default_factory=list)
+    time_tolerance: int = 900
+
     recipients: list[dict] = field(default_factory=list)
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import deliver, engine, store
+from . import clockguard, deliver, engine, store
 from .config import Config
 from .deliver import Transport
 
@@ -23,9 +23,41 @@ def run_tick(
     cfg: Config,
     transport: Transport,
     now: int,
+    verdict: clockguard.Verdict | None = None,
 ) -> dict:
-    evaluations = engine.tick_all(conn, audit_key, now)
-    summary: dict = {"at": now, "switches": [], "deliveries": [], "watchdog": None}
+    if verdict is None:
+        sources = tuple(sw.time_sources for sw in cfg.switches.values() if sw.time_sources)
+        verdict = clockguard.assess(
+            now, sources or (), tolerance=next(
+                (sw.time_tolerance for sw in cfg.switches.values() if sw.time_sources), 900
+            )
+        )
+    # "disagree" is the only fail-secure state: the clock itself is in question,
+    # so no switch is allowed to move. A missing second clock is "uncorroborated",
+    # which slows escalation down but never speeds it up.
+    clock_ok = verdict.status != "disagree"
+
+    evaluations = engine.tick_all(
+        conn, audit_key, now,
+        max_credit=next(
+            (sw.max_credit for sw in cfg.switches.values() if sw.time_sources), 3 * 86400
+        ),
+        corroborated=verdict.status == "ok",
+        clock_ok=clock_ok,
+    )
+    summary: dict = {
+        "at": now,
+        "switches": [],
+        "deliveries": [],
+        "watchdog": None,
+        "clock": {
+            "status": verdict.status,
+            "detail": verdict.detail,
+            "external": verdict.external,
+            "spread": verdict.spread,
+            "trusted": clock_ok,
+        },
+    }
 
     for evaluation in evaluations:
         switch = store.get_switch(conn, evaluation.switch_id)

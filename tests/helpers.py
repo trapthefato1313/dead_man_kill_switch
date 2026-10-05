@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dmks import config as config_mod, liveness, runner, seal, store
+from dmks import clockguard, config as config_mod, liveness, runner, seal, store
 from dmks.deliver import NullTransport, Transport
 
 T0 = 1_700_000_000
@@ -96,8 +96,14 @@ class Base(unittest.TestCase):
     def advance(self, seconds: int) -> None:
         self.now += seconds
 
-    def tick(self, transport: Transport | None = None) -> dict:
-        return runner.run_tick(self.conn, self.key, self.cfg, transport or self.transport, self.now)
+    def tick(self, transport: Transport | None = None, corroborated: bool = True) -> dict:
+        """corroborated=True models real downtime: the server was off and an
+        independent clock confirms the gap, so the full elapsed time is credited.
+        corroborated=False models a lone clock that jumped, which is capped."""
+        return runner.run_tick(
+            self.conn, self.key, self.cfg, transport or self.transport, self.now,
+            verdict=clockguard.Verdict("ok" if corroborated else "uncorroborated"),
+        )
 
     def state(self) -> str:
         return store.get_switch(self.conn, "s")["state"]

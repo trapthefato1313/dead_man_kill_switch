@@ -26,9 +26,14 @@ conscientemente.
 1. **Estado derivado do relógio, não de execuções.** Uma máquina que esteve
    desligada uma semana chega à conclusão certa no primeiro tick de volta. Nada
    depende de o worker ter corrido a horas.
-2. **Relógio monotónico.** Uma correcção de NTP ou um bug de fuso horário não
-   pode adiantar a escalada. O tempo efectivo nunca recua abaixo da marca
-   guardada. Falha para o lado seguro.
+2. **Relógio corroborado, e o tempo creditado é diferente do tempo observado.**
+   Uma correcção de NTP, um bug de fuso ou um VM que acorda com o relógio
+   adiantado não podem fazer o switch disparar sozinhos. A marca de água guarda
+   o tempo **creditado**, nunca o observado: sem isso, um salto de dez anos
+   num único tecto era aceites e o tecto seguinte creditava-o todo. Uma
+   avaliação só credita `max_credit` (3 dias) sem confirmação externa, e num
+   banco de dados novo o tempo é limitado à idade do próprio switch. Se os
+   relógios discordarem, o switch **congela** — não escala, e avisa-te.
 3. **Entrega exactamente uma vez.** A linha em `deliveries` é a chave de
    idempotência. Crash entre "estado = released" e "email enviado" é seguro: o
    tick seguinte reenvia. Crash depois do email é seguro: a linha já estava
@@ -232,6 +237,14 @@ Se nenhum dos dois for possível, a alternativa honesta é um relay SMTP neutro
 uma rota de saída.
 
 ## Limites, ditos com todas as letras
+
+- **O tecto do relógio atrasa libertações, não as impede.** Com `max_credit` a
+  3 dias e sem corroboração, um servidor que esteve 30 dias fora do ar precisa
+  de ~10 avaliações para recuperar a escalada. Se isso for demasiado lento,
+  configura `time_sources` para ter uma segunda fonte de tempo a confirmar.
+- **Um check-in automático destrói o switch.** Se um `cron` faz check-in por ti,
+  o aparelho nunca morre e a prova nunca sai. O check-in tem de exigir um humano,
+  com nonce fresco.
 
 - **Não é infallível.** Se morres e o pacote não chegou a lado nenhum, não há
   nada a fazer. É a razão de existirem as cópias redundantes.

@@ -51,8 +51,13 @@ class Harness:
     def advance(self, seconds: int) -> None:
         self.now += seconds
 
-    def tick(self) -> engine.Evaluation:
-        return engine.evaluate(self.conn, self.key, "s", self.now)
+    def tick(self, corroborated: bool = True) -> engine.Evaluation:
+        """corroborated=True means an independent clock vouched for the elapsed
+        time, i.e. the server really was off. corroborated=False is a lone clock
+        that jumped, which the guard caps."""
+        return engine.evaluate(
+            self.conn, self.key, "s", self.now, corroborated=corroborated
+        )
 
     def state(self) -> str:
         return store.get_switch(self.conn, "s")["state"]
@@ -146,14 +151,39 @@ def _clock_regression(root: Path) -> bool:
     )
 
 
-@check("downtime does not lose escalation")
+@check("real downtime does not lose escalation")
 def _catch_up(root: Path) -> bool:
+    """The server was genuinely off for 400 days and an external clock says so."""
     h = Harness(root)
     h.enroll("phone")
     h.advance(400 * 86400)
     h.tick()
     h.tick()
     return h.state() == "released"
+
+
+@check("an uncorroborated clock jump is capped, not credited")
+def _jump_is_capped(root: Path) -> bool:
+    """One evaluation may not credit a decade of silence on its own word.
+
+    This is the invariant whose absence made an NTP step able to release the
+    switch by itself. It delays the release instead of pretending it happened.
+    """
+    h = Harness(root)
+    h.enroll("phone")
+    h.advance(400 * 86400)
+    h.tick(corroborated=False)
+    credited = store.clock_watermark(h.conn) - T0
+    return credited <= 3 * 86400 and h.state() != "released"
+
+
+@check("disagreeing clocks freeze the switch")
+def _disagree_freezes(root: Path) -> bool:
+    h = Harness(root)
+    h.enroll("phone")
+    h.advance(400 * 86400)
+    result = engine.evaluate(h.conn, h.key, "s", h.now, clock_ok=False)
+    return h.state() == "ok" and result.escalated is False
 
 
 @check("released is terminal")
