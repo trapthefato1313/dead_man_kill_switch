@@ -37,6 +37,30 @@ def run_tick(
     # which slows escalation down but never speeds it up.
     clock_ok = verdict.status != "disagree"
 
+    # Fail-secure without a voice is a trap: if the clock disagrees and nobody is
+    # told, the switch silently stops escalating and the owner only discovers it
+    # when the packet never leaves. So the freeze is announced, once per hour.
+    if not clock_ok:
+        switches = store.list_switches(conn)
+        if switches:
+            deliver.notify(
+                conn, audit_key, cfg, switches[0],
+                kind="clock:disagree",
+                bucket=str(int(now // 3600)),
+                subject="[dead man's switch] relogio em desacordo: escalada congelada",
+                body=(
+                    "Os relogios externos contradizem-se, por isso o switch NAO avanca.\n\n"
+                    f"Detalhe: {verdict.detail}\n"
+                    f"Fontes externas: {verdict.external if verdict.external is not None else 'nenhuma'}\n"
+                    f"Desvio entre fontes: {verdict.spread if verdict.spread is not None else 'n/a'}s\n\n"
+                    "Isto e fail-secure: nada dispara enquanto o relogio nao for fiavel.\n"
+                    "Se o servidor estiver bem, corrige o relogio (NTP) e verifica as fontes.\n"
+                    "O estado atual mantem-se exatamente onde estava."
+                ),
+                transport=transport,
+                now=now,
+            )
+
     evaluations = engine.tick_all(
         conn, audit_key, now,
         max_credit=next(

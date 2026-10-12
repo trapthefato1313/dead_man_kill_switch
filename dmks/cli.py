@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import secrets
@@ -60,6 +61,20 @@ def cmd_init(args) -> int:
     cfg.server.smtp_host = args.smtp_host
     cfg.server.smtp_port = args.smtp_port
     cfg.server.smtp_from = args.smtp_from
+    cfg.server.smtp_user = args.smtp_user
+    cfg.server.smtp_password = args.smtp_password
+    cfg.server.smtp_strategy = args.smtp_strategy
+    for spec in (args.smtp_servers or []):
+        name, rest = spec.split("=", 1) if "=" in spec else (spec, spec)
+        host, _, port = rest.partition(":")
+        entry = {"name": name, "host": host, "port": int(port) if port else args.smtp_port}
+        if args.smtp_from:
+            entry["from"] = args.smtp_from
+        if args.smtp_user:
+            entry["user"] = args.smtp_user
+        if args.smtp_password:
+            entry["password"] = args.smtp_password
+        cfg.server.smtp_servers.append(entry)
     cfg.server.webhook_urls = list(args.webhook_urls or [])
     cfg.server.publish_dir = args.publish_dir
 
@@ -107,6 +122,27 @@ def cmd_init(args) -> int:
 
 
 # --- devices -------------------------------------------------------------
+
+
+def cmd_owner_password(args) -> int:
+    """Set or change the panel password.
+
+    Deliberately separate from the owner secret: the secret is what a device
+    needs to check in cryptographically and must never be typed into a browser.
+    This only gates the panel.
+    """
+    cfg, conn = _load(args)
+    switch_id = _resolve(conn, args)
+    password = args.password or getpass.getpass("palavra-passe do dono: ")
+    if len(password) < 12:
+        raise SystemExit("palavra-passe demasiado curta: 12 caracteres no minimo")
+    with store.tx(conn):
+        store.set_owner_pwhash(conn, switch_id, liveness.hash_password(password))
+        audit.append(conn, cfg.audit_key, int(time.time()), "owner_password_set",
+                     {"switch": switch_id})
+    print(f"palavra-passe do painel definida para {switch_id}")
+    print("A palavra-passe do dono (owner secret) nao foi alterada.")
+    return 0
 
 
 def cmd_enroll(args) -> int:
@@ -319,6 +355,20 @@ def cmd_cancel(args) -> int:
     return 0
 
 
+def cmd_force_release(args) -> int:
+    cfg, conn = _load(args)
+    switch_id = _resolve(conn, args)
+    now = int(time.time())
+    nonce = liveness.new_nonce()
+    token = liveness.sign_owner_force(args.secret, switch_id, now, nonce)
+    try:
+        previous = liveness.force_release(conn, cfg.audit_key, switch_id, now, nonce, token, now)
+    except liveness.AuthError as exc:
+        raise SystemExit(f"recusado: {exc}") from exc
+    print(f"forcado: {previous} -> released (auditado; entrega no proximo tick)")
+    return 0
+
+
 def cmd_tick(args) -> int:
     cfg, conn = _load(args)
     transport = deliver.build_transport(cfg)
@@ -356,6 +406,59 @@ def cmd_serve(args) -> int:
         print("parado")
     finally:
         httpd.server_close()
+    return 0
+
+
+def cmd_sink(args) -> int:
+    """Run one SMTP receiving node: the software for a single computer of the fleet."""
+    from . import sink as sink_mod
+
+    node = sink_mod.Sink(
+        host=args.bind, port=args.port,
+        spool=Path(args.spool), name=args.name,
+    )
+    node.start()
+    print(f"sink {args.name}: SMTP em {args.bind}:{node.port}", flush=True)
+    print(f"spool : {node.spool}", flush=True)
+    print("ctrl-c para parar", flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop()
+    return 0
+
+
+def cmd_fleet(args) -> int:
+    """Bring up N independent SMTP nodes on consecutive ports.
+
+    For the sandbox/lab this proves the mechanism at scale on one host. For a
+    real network, run `dmks sink` once per computer instead: independence
+    comes from separate hosts, not from a bigger port range.
+    """
+    from . import sink as sink_mod
+
+    nodes = []
+    root = Path(args.spool_root).expanduser()
+    try:
+        for i in range(args.count):
+            node = sink_mod.Sink(
+                host=args.bind, port=args.base_port + i,
+                spool=root / f"node-{i}", name=f"node-{i}",
+            )
+            node.start()
+            nodes.append(node)
+            print(f"node-{i:<4} {args.bind}:{node.port}", flush=True)
+        print(f"{len(nodes)} sinks no ar; ctrl-c para parar", flush=True)
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for node in nodes:
+            node.stop()
     return 0
 
 
@@ -509,6 +612,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smtp-host")
     p.add_argument("--smtp-port", type=int, default=587)
     p.add_argument("--smtp-from")
+    p.add_argument("--smtp-user")
+    p.add_argument("--smtp-password", help="usa 'env:VAR' para ler do ambiente em vez do ficheiro")
+    p.add_argument(
+        "--smtp-server", action="append", dest="smtp_servers",
+        metavar="NAME=HOST[:PORT]",
+        help="no de entrega (repetivel). 'failover' usa-os como relays; 'fanout' replica por no",
+    )
+    p.add_argument("--smtp-strategy", choices=("fanout", "failover"), default="fanout")
     p.add_argument("--webhook-url", action="append", dest="webhook_urls",
                    metavar="URL",
                    help="repeatable: every URL gets the packet, independently")
@@ -573,6 +684,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--secret", required=True)
     p.set_defaults(func=cmd_cancel)
 
+    p = sub.add_parser("force-release", help="dispara ja com o secret do dono (auditado)")
+    p.add_argument("--switch")
+    p.add_argument("--secret", required=True)
+    p.set_defaults(func=cmd_force_release)
+
     p = sub.add_parser("tick", help="corre uma avaliacao e sai")
     p.add_argument("--now", type=int, help="epoch para simular (util em testes)")
     p.set_defaults(func=cmd_tick)
@@ -580,9 +696,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("worker", help="loop de avaliacao")
     p.set_defaults(func=cmd_worker)
 
+    p = sub.add_parser("owner-password", help="define a palavra-passe do painel web")
+    p.add_argument("--switch")
+    p.add_argument("--password", help="evita o prompt; fica no historico do shell")
+    p.set_defaults(func=cmd_owner_password)
+
     p = sub.add_parser("serve", help="servidor HTTP")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("sink", help="nó SMTP para a rede de computadores")
+    p.add_argument("--bind", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=2525)
+    p.add_argument("--spool", default="dmks-sink")
+    p.add_argument("--name", default="node")
+    p.set_defaults(func=cmd_sink)
+
+    p = sub.add_parser("fleet", help="levanta N nós SMTP numa só máquina (laboratorio)")
+    p.add_argument("--bind", default="127.0.0.1")
+    p.add_argument("--base-port", type=int, default=2525)
+    p.add_argument("--count", type=int, default=300)
+    p.add_argument("--spool-root", default="dmks-fleet")
+    p.set_defaults(func=cmd_fleet)
 
     p = sub.add_parser("verify", help="verifica a cadeia de auditoria")
     p.set_defaults(func=cmd_verify)

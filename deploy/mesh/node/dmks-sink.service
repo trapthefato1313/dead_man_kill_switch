@@ -1,0 +1,34 @@
+[Unit]
+Description=dmks sink node (@@NODE_NAME@@)
+Documentation=https://example.invalid/dmks
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=dmks
+Group=dmks
+Environment=PYTHONPATH=/opt
+WorkingDirectory=/var/lib/dmks-sink
+ExecStart=/usr/bin/python3 -m dmks sink --bind @@WG_IP@@ --port @@SINK_PORT@@ --spool @@SPOOL@@ --name @@NODE_NAME@@
+Restart=on-failure
+RestartSec=5s
+
+# Hardening: o no so precisa de ler o codigo e escrever no spool.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/dmks-sink
+
+[Install]
+WantedBy=multi-user.target

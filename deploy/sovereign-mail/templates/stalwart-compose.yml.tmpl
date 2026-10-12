@@ -1,0 +1,30 @@
+# Copia para CADA no (VPS 1, 2, 3) e ajusta NODE_HOSTNAME:
+#   no 1 -> ${NODE1_HOSTNAME}   no 2 -> ${NODE2_HOSTNAME}   no 3 -> ${NODE3_HOSTNAME}
+#
+# Stalwart v0.16+: o configuracao vive na base de dados (objetos JMAP), montada em
+# /var/lib/stalwart. O /etc/stalwart so guarda o pequeno config.json do datastore.
+# No primeiro arranque nao ha config: entra em modo bootstrap e serve o wizard em
+# http://IP_DO_NO:8080/admin (credencial definida abaixo). Apos o wizard, a UI passa
+# para https://NODE_HOSTNAME/admin e o :8080 deixa de servir.
+services:
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16
+    restart: unless-stopped
+    hostname: ${NODE1_HOSTNAME}
+    environment:
+      # Credencial de bootstrap/recovery: evita depender da password aleatoria dos logs.
+      # Formato admin:PASSWORD. Troca-a e REMOVE-A depois de criares o admin definitivo.
+      STALWART_RECOVERY_ADMIN: ${STALWART_RECOVERY_ADMIN}
+    ports:
+      - "25:25"       # SMTP (recebimento / bounces)
+      - "465:465"     # SMTPS
+      - "587:587"     # Submission (o Listmonk e o switch ligam-se aqui)
+      - "993:993"     # IMAPS (caixa de bounce)
+      - "8080:8080"   # wizard de setup (restringe por firewall ao teu IP)
+    volumes:
+      - stalwart-etc:/etc/stalwart       # config.json do datastore
+      - stalwart-data:/var/lib/stalwart  # TODA a configuracao e o correio
+
+volumes:
+  stalwart-etc:
+  stalwart-data:

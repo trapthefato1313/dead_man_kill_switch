@@ -170,7 +170,10 @@ class MigrationFromV1(unittest.TestCase):
             path = Path(tmp) / "d.sqlite3"
             self._make_v1(path)
             conn = store.connect(path)
-            self.assertEqual(store.get_meta(conn, "schema_version"), "2")
+            self.assertEqual(store.get_meta(conn, "schema_version"), "3")
+            # v2 -> v3 adds a nullable owner password. An old switch has none, so
+            # the panel refuses it until an owner sets one: closed, never open.
+            self.assertIsNone(store.get_owner_pwhash(conn, "s"))
             self.assertTrue(
                 store.delivered_before(conn, "s", "p1", "advogado@exemplo.pt", "release")
             )

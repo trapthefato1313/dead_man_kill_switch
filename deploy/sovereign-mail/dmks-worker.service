@@ -1,0 +1,39 @@
+[Unit]
+Description=dmks worker (avaliacao + entrega do switch)
+Documentation=https://example.invalid/dmks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dmks
+Group=dmks
+Environment=PYTHONPATH=/opt
+Environment=DMKS_DATA_DIR=/var/lib/dmks
+# O worker precisa de VER a chave publica dos destinatarios para conseguir
+# selar/verificar. Sem keyring a entrega e RECUSADA (no usable public key).
+# O keyring vive fora do home porque ProtectHome=true esconde ~/.gnupg.
+Environment=GNUPGHOME=/var/lib/dmks/gnupg
+WorkingDirectory=/var/lib/dmks
+ExecStart=/usr/bin/python3 -m dmks --data-dir /var/lib/dmks worker
+Restart=on-failure
+RestartSec=10s
+
+# Hardening. Nota: ProtectSystem=strict exige ReadWritePaths para a data dir e
+# para o keyring; os sockets unix do gpg-agent vivem no GNUPGHOME.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/dmks /var/lib/dmks/gnupg
+
+[Install]
+WantedBy=multi-user.target

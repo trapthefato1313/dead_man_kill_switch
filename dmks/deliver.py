@@ -125,6 +125,32 @@ class Channel:
 
 
 @dataclass
+class FailoverTransport:
+    """A pool of interchangeable relays for the same recipient.
+
+    Unlike the fan-out fleet, where every node keeps its own copy, these nodes
+    all deliver to the *same* inbox, so trying them all would mail the dossier
+    several times. The point is only that one working node gets it out before
+    the others are censored or seized, so the first success ends the attempt and
+    the rest are touched only if the previous one failed.
+    """
+
+    channels: list[Channel]
+    last: str | None = None
+
+    def send(self, target: dict, subject: str, body: str, attachment: Path | None = None) -> None:
+        errors: list[str] = []
+        for channel in self.channels:
+            try:
+                channel.send(target, subject, body, attachment)
+                self.last = channel.name
+                return
+            except Exception as exc:  # noqa: BLE001 - the next relay is tried
+                errors.append(f"{channel.name}: {type(exc).__name__}: {exc}")
+        raise TransportError("every relay node failed: " + "; ".join(errors))
+
+
+@dataclass
 class FanOut:
     """Sends to every channel and reports each result separately.
 
@@ -200,6 +226,37 @@ def build_transport(cfg: Config, override: Transport | None = None) -> Transport
                 ),
             )
         )
+    # The fleet: one independent channel per SMTP node.
+    #
+    # fanout   - every node receives the packet; the target counts as delivered
+    #            only when all of them confirmed (private stores / cofres).
+    # failover - the nodes are relays for the same inbox; they collapse into a
+    #            single channel that stops at the first success (real MTA pool).
+    def _server_transport(entry: dict, index: int) -> SmtpTransport:
+        return SmtpTransport(
+            host=entry["host"],
+            port=int(entry.get("port", server.smtp_port)),
+            sender=entry.get("from") or server.smtp_from,
+            user=entry.get("user") or server.smtp_user,
+            password=entry.get("password") or server.smtp_password,
+            starttls=bool(entry.get("starttls", True)),
+        )
+
+    if server.smtp_strategy == "failover" and server.smtp_servers:
+        relays = [
+            Channel(
+                name=f"smtp:{entry.get('name') or f'relay-{index}'}",
+                transport=_server_transport(entry, index),
+            )
+            for index, entry in enumerate(server.smtp_servers)
+        ]
+        channels.append(Channel(name="smtp:relay", transport=FailoverTransport(channels=relays)))
+    else:
+        for index, entry in enumerate(server.smtp_servers):
+            label = entry.get("name") or f"fleet-{index}"
+            channels.append(
+                Channel(name=f"smtp:{label}", transport=_server_transport(entry, index))
+            )
     for index, url in enumerate(server.all_webhook_urls()):
         channels.append(Channel(name=f"webhook:{index}", transport=WebhookTransport(url)))
     if not channels:

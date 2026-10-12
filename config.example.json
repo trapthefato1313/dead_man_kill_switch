@@ -1,0 +1,38 @@
+{
+  "_comment": "Exemplo GENERICO de entrega. Faz merge da seccao 'server' no teu <data-dir>/config.json. Substitui host/from pelos teus. A password NUNCA vai aqui em claro: usa env:VAR e exporta a variavel no servico.",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8770,
+
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "smtp_user": "env:SMTP_USER",
+    "smtp_password": "env:SMTP_PASSWORD",
+    "smtp_from": "switch@example.com",
+    "smtp_starttls": true,
+
+    "_smtp_strategy": "fanout = todos os nos guardam copia (cofres). failover = relays reais: entrega exatamente UMA copia por destinatario, saltando nos mortos. Usa failover com MTAs proprios (Stalwart).",
+    "smtp_strategy": "fanout",
+
+    "smtp_servers": [
+      {
+        "name": "relay-a",
+        "host": "smtp.example.com",
+        "port": 587,
+        "from": "env:SMTP_FROM",
+        "user": "env:SMTP_USER",
+        "password": "env:SMTP_PASSWORD",
+        "starttls": true
+      },
+      {
+        "name": "relay-b",
+        "host": "smtp2.example.com",
+        "port": 587,
+        "from": "env:SMTP_FROM",
+        "user": "env:SMTP_USER",
+        "password": "env:SMTP_PASSWORD",
+        "starttls": true
+      }
+    ]
+  }
+}

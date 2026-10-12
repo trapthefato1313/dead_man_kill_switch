@@ -1,0 +1,42 @@
+# Inventario da malha. Copia para inventory.toml e preenche.
+#
+# Topologia suportada: hub-and-spoke. O hub (normalmente o host do switch)
+# tem um IP na malha; cada no liga-se ao hub e o hub encaminha. Gera-se um
+# ficheiro WireGuard por host e o fragmento 'smtp_servers' para o switch.
+#
+# As chaves: se 'generate_keys = true' e o binario `wg` estiver instalado na
+# maquina que corre o generate.py, as chaves privadas sao geradas e escritas
+# em out/wg/keys/. Caso contrario, preenche 'private_key'/'public_key' a mao
+# (a publica do hub e a privada de cada no viajam no bundle para esse host).
+
+[mesh]
+generate_keys = true
+wg_port = 51820
+sink_port = 2525
+network = "10.66.0.0/24"
+
+[hub]
+name = "hub"
+address = "10.66.0.1/24"
+endpoint = "hub.SEUDOMINIO.COM:51820"
+# Necessaria se generate_keys = false:
+public_key = ""
+private_key = ""
+
+# O switch usa este remetente em todos os nos.
+[sender]
+from = "switch@news.SEUDOMINIO.COM"
+
+[[node]]
+name = "node-001"
+address = "10.66.0.11/32"
+public_host = "203.0.113.10"
+public_key = ""
+private_key = ""
+
+[[node]]
+name = "node-002"
+address = "10.66.0.12/32"
+public_host = "203.0.113.11"
+public_key = ""
+private_key = ""

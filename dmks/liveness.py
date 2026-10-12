@@ -23,6 +23,8 @@ DEVICE_DOMAIN = b"dmks-device-key-v1|"
 OWNER_DOMAIN = b"dmks-owner-key-v1|"
 CHECKIN_TAG = "checkin"
 CANCEL_TAG = "cancel"
+FORCE_TAG = "force-release"
+OWNER_DEVICE = "owner"
 
 
 class AuthError(Exception):
@@ -68,6 +70,12 @@ def sign_device(secret: str, switch_id: str, device_id: str, ts: int, nonce: str
 
 def sign_owner(secret: str, switch_id: str, ts: int, nonce: str) -> str:
     msg = f"{CANCEL_TAG}|{switch_id}|{ts}|{nonce}"
+    return _token(owner_key_hex(secret), msg)
+
+
+def sign_owner_force(secret: str, switch_id: str, ts: int, nonce: str) -> str:
+    """Owner token for an explicit release, distinct from cancel."""
+    msg = f"{FORCE_TAG}|{switch_id}|{ts}|{nonce}"
     return _token(owner_key_hex(secret), msg)
 
 
@@ -139,6 +147,97 @@ def checkin(
     return CheckinResult(device_id=device_id, switch_id=switch_id, at=now, pruned=pruned)
 
 
+def hash_password(password: str, *, iterations: int = 200_000) -> str:
+    """PBKDF2 verifier for the web panel.
+
+    This never replaces `owner_key`: the owner secret still never leaves the
+    server. The password only gates the panel, and is verified against a salted
+    hash so a stolen database does not hand over the panel.
+    """
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(encoded: str, password: str) -> bool:
+    try:
+        algo, iterations, salt_hex, digest_hex = encoded.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(expected, actual)
+
+
+def owner_checkin(
+    conn: sqlite3.Connection,
+    audit_key: bytes,
+    switch_id: str,
+    now: int,
+) -> dict:
+    """Proof of life from the owner, from any device, with no enrolled secret.
+
+    This is what the panel button calls. The owner typing their password is the
+    signal: it cannot be produced by a cron, so a scheduled task cannot keep the
+    switch quiet on its own. It records under the reserved device id `owner`, so
+    it flows through the same pruning, the same silence computation and the same
+    audit chain as a device check-in, and cannot be mistaken for one.
+    """
+    switch = store.get_switch(conn, switch_id)
+    if switch is None:
+        raise AuthError("unknown switch")
+
+    previous = switch["state"]
+    # A fresh nonce every time. The device path gets its nonce from the client
+    # to prove freshness; the owner path has no client, but checkins is
+    # UNIQUE(device_id, nonce), so a fixed value here would allow exactly one
+    # lifetime check-in and then start throwing IntegrityError.
+    nonce = new_nonce()
+    if previous == "released":
+        # Terminal on purpose. Proof of life after release is good news for the
+        # owner and worth a record, but it must never un-send the packet.
+        with store.tx(conn):
+            store.record_checkin(conn, switch_id, OWNER_DEVICE, nonce, now, now)
+            head = audit.append(
+                conn, audit_key, now, "owner_confirmed_after_release", {"switch": switch_id}
+            )
+    else:
+        with store.tx(conn):
+            store.record_checkin(conn, switch_id, OWNER_DEVICE, nonce, now, now)
+            # Reset now, not on the next tick. The evidence is already durable;
+            # leaving the switch on AVISO after the owner proved they are alive
+            # would be a lie, and `armed` would be worse.
+            store.update_switch(conn, switch_id, state="ok", now=now, confirm_count=0)
+            head = audit.append(
+                conn,
+                audit_key,
+                now,
+                "owner_confirmed",
+                {
+                    "switch": switch_id,
+                    "from_state": previous,
+                    "note": "owner typed the panel password; a human is present",
+                },
+            )
+    return {
+        "switch": switch_id,
+        "at": now,
+        "from_state": previous,
+        "state": store.get_switch(conn, switch_id)["state"],
+        "receipt": {
+            "audit_seq": head["seq"],
+            "audit_hash": head["hash"],
+            "prev_hash": head["prev_hash"],
+            "at": now,
+            "from_state": previous,
+        },
+    }
+
+
 def cancel(
     conn: sqlite3.Connection,
     audit_key: bytes,
@@ -168,6 +267,52 @@ def cancel(
             audit_key,
             now,
             "cancelled",
+            {"switch": switch_id, "from_state": previous},
+        )
+    return previous
+
+
+def force_release(
+    conn: sqlite3.Connection,
+    audit_key: bytes,
+    switch_id: str,
+    ts: int,
+    nonce: str,
+    token: str,
+    now: int,
+) -> str:
+    """Owner-initiated release, bypassing the silence ladder.
+
+    The owner is the only one who can do this, it needs the owner secret, and it
+    is written to the audit log as an explicit act, so a release that did not
+    come from silence is always distinguishable afterwards.
+
+    Refuses a switch with nothing sealed: releasing an empty switch would
+    destroy the evidence trail while delivering nothing.
+    """
+    switch = store.get_switch(conn, switch_id)
+    if switch is None:
+        raise AuthError("unknown switch")
+
+    check_skew(ts, now, switch["clock_skew"])
+
+    message = f"{FORCE_TAG}|{switch_id}|{ts}|{nonce}"
+    if not hmac.compare_digest(_token(switch["owner_key"], message), token):
+        raise AuthError("bad owner token")
+
+    if not store.active_packets(conn, switch_id):
+        raise AuthError("nothing sealed: seal a packet before forcing a release")
+
+    previous = switch["state"]
+    with store.tx(conn):
+        store.update_switch(
+            conn, switch_id, state="released", now=now, released_at=now, confirm_count=0
+        )
+        audit.append(
+            conn,
+            audit_key,
+            now,
+            "force_release",
             {"switch": switch_id, "from_state": previous},
         )
     return previous

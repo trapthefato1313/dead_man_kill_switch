@@ -147,6 +147,38 @@ WantedBy=multi-user.target
 E o `serve` para o check-in por HTTP, protegido por systemd ou por um proxy com
 TLS. O `/api/tick` fica para o cron externo.
 
+### Painel web
+
+Para além da API, o `serve` mostra um painel no browser. É uma página só, sem
+dependências de terceiros, para o momento em que queres provar que estás vivo e
+ver quanto falta para o switch disparar.
+
+```bash
+python3 -m dmks --data-dir data owner-password   # pede a palavra-passe, sem eco
+python3 -m dmks --data-dir data serve
+# abre http://127.0.0.1:8770/
+```
+
+O painel mostra o estado, o tempo até à libertação e a razão de cada travão
+(relógio congelado, `release_mode = hold`, auditoria alterada). O botão "Estou
+vivo" faz um check-in a sério, registado na auditoria com recibo, e funciona a
+partir de qualquer aparelho — não precisas de ter ali um secret enrolado.
+
+Três decisões, e não acidentes:
+
+- **A palavra-passe do painel não é o owner secret.** É um segundo segredo, só
+  para o browser, guardado como hash salgado (PBKDF2). O owner secret continua a
+  nunca sair do servidor, e mudar a palavra-passe não mexe nele.
+- **O check-in volta a pedir a palavra-passe, mesmo com sessão aberta.** Sem
+  isso, um separador esquecido ou uma sessão roubada valia tanto como nunca
+  teres morrido: manteriam o switch adormecido para sempre.
+- **Sem palavra-passe, o painel recusa.** Um switch criado antes desta versão
+  não tem palavra-passe; o `owner-password` põe uma. Falha fechado, nunca
+  aberto.
+
+A sessão vive só em memória: um restart do servidor desliga o painel, que é o
+lado seguro para falhar.
+
 ## Estados
 
 | Estado | Quando | O que acontece |
@@ -162,6 +194,16 @@ a estar vivo tem sempre de ser mais rápido do que parecer estar morto.
 
 `dmks cancel --switch main --secret "$DMKS_OWNER_SECRET"` aborta a escalada a
 partir de qualquer lado, com o secret do dono.
+
+`dmks force-release --switch main --secret "$DMKS_OWNER_SECRET"` dispara **já**
+(passa a `released` e o próximo tick entrega), sem esperar o silêncio. Exige o
+secret do dono, recusa-se se nada estiver selado, e fica no registo de auditoria
+como `force_release` — distinto de um disparo por silêncio, para que o porquê do
+disparo seja sempre verificável depois.
+
+> Livro de regras: `cancel` e `force-release` usam **tags HMAC distintas**, por
+> isso um token de cancelamento não pode ser reaproveitado como disparo. Ambos os
+> eventos são gravados na cadeia de auditoria.
 
 ### Dois prazos em vez de três
 

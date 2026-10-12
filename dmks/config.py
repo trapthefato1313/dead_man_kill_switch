@@ -9,6 +9,7 @@ multiple silent devices required, and re-confirmation before each escalation.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -79,6 +80,22 @@ class ServerConfig:
     smtp_from: str | None = None
     smtp_starttls: bool = True
 
+    # An independent fleet of SMTP servers, usually one per computer on a
+    # private network. Each entry becomes its own delivery channel, so the
+    # packet is sent to every node and a single censored or seized host cannot
+    # wipe out the evidence. Fields: name, host, port, from, user, password,
+    # starttls.
+    smtp_servers: list[dict] = field(default_factory=list)
+
+    # How the smtp_servers list is used:
+    #   "fanout"   -> every node receives its own copy. Right when the nodes are
+    #                 private stores/cofres, whose only job is to hold the packet.
+    #   "failover" -> the nodes are interchangeable relays for a real recipient;
+    #                 exactly one delivers and the next is tried only if the
+    #                 previous fails. Sending through all of them would mail the
+    #                 dossier three times, so fan-out is wrong here.
+    smtp_strategy: str = "fanout"
+
     webhook_url: str | None = None
     webhook_urls: list[str] = field(default_factory=list)
 
@@ -126,6 +143,17 @@ def new_audit_key() -> bytes:
     return secrets.token_bytes(32)
 
 
+def _secret(value):
+    """Resolve `env:VAR` to the environment.
+
+    Credentials never belong in a config file on disk: write `env:SMTP_PASSWORD`
+    and export the real value in the service environment instead.
+    """
+    if isinstance(value, str) and value.startswith("env:"):
+        return os.environ.get(value[4:], "")
+    return value
+
+
 def load(data_dir: Path, key: bytes | None = None) -> Config:
     """Load config from <data_dir>/config.json, falling back to defaults."""
     data_dir = Path(data_dir)
@@ -136,6 +164,12 @@ def load(data_dir: Path, key: bytes | None = None) -> Config:
 
     server_fields = {f.name for f in ServerConfig.__dataclass_fields__.values()}  # type: ignore[attr-defined]
     server = ServerConfig(**{k: v for k, v in raw.get("server", {}).items() if k in server_fields})
+    server.smtp_user = _secret(server.smtp_user)
+    server.smtp_password = _secret(server.smtp_password)
+    for entry in server.smtp_servers:
+        for field_name in ("user", "password", "from"):
+            if field_name in entry:
+                entry[field_name] = _secret(entry[field_name])
 
     switches: dict[str, SwitchConfig] = {}
     for sid, val in raw.get("switches", {}).items():
@@ -165,6 +199,11 @@ def save(cfg: Config) -> None:
 def validate(cfg: Config) -> list[str]:
     """Return a list of configuration problems. Empty means valid."""
     problems: list[str] = []
+    if cfg.server.smtp_strategy not in ("fanout", "failover"):
+        problems.append(
+            f"server.smtp_strategy must be 'fanout' or 'failover', "
+            f"got {cfg.server.smtp_strategy!r}"
+        )
     for sid, sw in cfg.switches.items():
         arm = resolve_arm(sw)
         if not (0 < sw.warn_after < arm < sw.release_after):
@@ -188,9 +227,9 @@ def validate(cfg: Config) -> list[str]:
             if not sw.recipients:
                 problems.append(f"{sid}: release_mode {sw.release_mode!r} needs recipients")
         if sw.release_mode == "notify" and not (
-            cfg.server.smtp_host or cfg.server.all_webhook_urls()
+            cfg.server.smtp_host or cfg.server.smtp_servers or cfg.server.all_webhook_urls()
         ):
-            problems.append(f"{sid}: release_mode 'notify' needs smtp_host or a webhook_url")
+            problems.append(f"{sid}: release_mode 'notify' needs smtp_host, smtp_servers or a webhook_url")
         if sw.release_mode == "publish" and not cfg.server.publish_dir:
             problems.append(f"{sid}: release_mode 'publish' needs server.publish_dir")
     return problems

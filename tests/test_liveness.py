@@ -118,5 +118,60 @@ class CancelAuth(Base):
         self.assertIn("cancelled", events)
 
 
+class ForceReleaseAuth(Base):
+    def _force(self, secret="owner-secret-for-tests", switch="s", ts=None, nonce=None):
+        ts = ts if ts is not None else self.now
+        nonce = nonce or liveness.new_nonce()
+        token = liveness.sign_owner_force(secret, switch, ts, nonce)
+        return liveness.force_release(self.conn, self.key, switch, ts, nonce, token, self.now)
+
+    def test_owner_can_force_release_immediately(self):
+        self.enroll("phone")
+        self.add_packet()
+        self.assertEqual(self.state(), "ok")
+        previous = self._force()
+        self.assertEqual(previous, "ok")
+        self.assertEqual(self.state(), "released")
+
+    def test_wrong_owner_secret_is_rejected(self):
+        self.enroll("phone")
+        self.add_packet()
+        with self.assertRaises(liveness.AuthError):
+            self._force(secret="palpite")
+
+    def test_cancel_token_cannot_be_reused_as_force(self):
+        self.enroll("phone")
+        self.add_packet()
+        nonce = liveness.new_nonce()
+        token = liveness.sign_owner("owner-secret-for-tests", "s", self.now, nonce)
+        with self.assertRaises(liveness.AuthError):
+            liveness.force_release(
+                self.conn, self.key, "s", self.now, nonce, token, self.now
+            )
+
+    def test_refuses_release_when_nothing_is_sealed(self):
+        self.enroll("phone")
+        with self.assertRaises(liveness.AuthError) as ctx:
+            self._force()
+        self.assertIn("nothing sealed", str(ctx.exception))
+        self.assertEqual(self.state(), "ok")
+
+    def test_force_release_is_recorded_in_the_audit_chain(self):
+        self.enroll("phone")
+        self.add_packet()
+        self._force()
+        events = [r["event"] for r in self.conn.execute("SELECT event FROM audit_log ORDER BY seq")]
+        self.assertIn("force_release", events)
+
+    def test_force_release_and_cancel_are_distinguishable(self):
+        self.enroll("phone")
+        self.add_packet()
+        self._force()
+        self.cancel()
+        events = [r["event"] for r in self.conn.execute("SELECT event FROM audit_log ORDER BY seq")]
+        self.assertIn("force_release", events)
+        self.assertIn("cancelled", events)
+
+
 if __name__ == "__main__":
     unittest.main()

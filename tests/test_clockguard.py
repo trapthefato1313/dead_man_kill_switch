@@ -169,7 +169,10 @@ class EndToEndClockSafety(Base):
                 verdict=clockguard.Verdict("disagree", detail="test"),
             )
         self.assertEqual(self.state(), "ok")
-        self.assertEqual(self.transport.sent, [])
+        # The freeze is not silent: the owner must be told once, so the
+        # only thing that ever leaves during a disagree is the clock alert.
+        subjects = {t[1] for t in self.transport.sent}
+        self.assertEqual(subjects, {"[dead man's switch] relogio em desacordo: escalada congelada"})
 
     def test_freezing_is_reported_in_the_summary(self):
         summary = runner.run_tick(

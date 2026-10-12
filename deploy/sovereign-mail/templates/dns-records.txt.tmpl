@@ -1,0 +1,30 @@
+; ============================================================
+;  Registos DNS a publicar na zona de ${DOMINIO}
+;  (gerado por render.sh — confirma os valores antes de publicar)
+; ============================================================
+
+; ---- 1. A (um por no) ----
+${NODE1_HOSTNAME}.   A   ${IP_NODE1}
+${NODE2_HOSTNAME}.   A   ${IP_NODE2}
+${NODE3_HOSTNAME}.   A   ${IP_NODE3}
+
+; ---- 2. rDNS/PTR: configura no PAINEL DE CADA PROVEDOR de VPS ----
+; ${IP_NODE1}  ->  ${NODE1_HOSTNAME}
+; ${IP_NODE2}  ->  ${NODE2_HOSTNAME}
+; ${IP_NODE3}  ->  ${NODE3_HOSTNAME}
+
+; ---- 3. SPF ----
+${NEWS_HOST}.   TXT   "v=spf1 ip4:${IP_NODE1} ip4:${IP_NODE2} ip4:${IP_NODE3} ~all"
+
+; ---- 4. DKIM (chave publica gerada no painel de cada no) ----
+${DKIM_SEL1}._domainkey.${NEWS_HOST}.   TXT   "v=DKIM1; k=rsa; p=CHAVE_PUBLICA_DO_NO_1"
+${DKIM_SEL2}._domainkey.${NEWS_HOST}.   TXT   "v=DKIM1; k=rsa; p=CHAVE_PUBLICA_DO_NO_2"
+${DKIM_SEL3}._domainkey.${NEWS_HOST}.   TXT   "v=DKIM1; k=rsa; p=CHAVE_PUBLICA_DO_NO_3"
+
+; ---- 5. DMARC (none -> 4-6 semanas: quarantine -> depois: reject) ----
+_dmarc.${NEWS_HOST}.   TXT   "v=DMARC1; p=none; rua=mailto:dmarc@${DOMINIO}; fo=1"
+
+; ---- 6. MX (bounces voltam pelos nos) ----
+${NEWS_HOST}.   MX   10 ${NODE1_HOSTNAME}.
+${NEWS_HOST}.   MX   20 ${NODE2_HOSTNAME}.
+${NEWS_HOST}.   MX   30 ${NODE3_HOSTNAME}.

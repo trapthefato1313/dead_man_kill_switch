@@ -1,0 +1,19 @@
+[app]
+address = "0.0.0.0:9000"
+admin_username = "listmonk"
+admin_password = "${LISTMONK_ADMIN_PASSWORD}"
+
+[db]
+host = "db"
+port = 5432
+user = "listmonk"
+password = "${LISTMONK_DB_PASSWORD}"
+database = "listmonk"
+ssl_mode = "disable"
+max_open = 25
+max_idle = 25
+max_lifetime = "300s"
+
+# Deixa o Listmonk tratar do List-Unsubscribe / List-Unsubscribe-Post.
+[privacy]
+individual_tracking = false

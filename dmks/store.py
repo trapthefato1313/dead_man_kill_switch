@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS switches (
     clock_skew     INTEGER NOT NULL,
     recipients     TEXT NOT NULL,
     owner_key      TEXT NOT NULL,
+    owner_pwhash   TEXT,
     state          TEXT NOT NULL,
     state_since    INTEGER NOT NULL,
     confirm_count  INTEGER NOT NULL DEFAULT 0,
@@ -128,7 +129,12 @@ CREATE TABLE IF NOT EXISTS watchdog (
 def connect(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None, timeout=30.0)
+    # check_same_thread=False because the HTTP server is a ThreadingHTTPServer:
+    # one thread per request, all sharing this connection. Safety comes from
+    # the server's own mutex, which serialises every read and write, and from
+    # SQLite's own locking. Without this flag every request 500s - which is how
+    # the panel's first tests found it.
+    conn = sqlite3.connect(path, isolation_level=None, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
@@ -145,15 +151,19 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """v1 -> v2: deliveries gains a per-channel column.
+    """Bring an older database up to the current schema, in order.
 
-    The UNIQUE constraint changed too, which SQLite cannot alter in place, so
-    the table is rebuilt. Pre-v2 rows carry channel '' and stay delivered.
+    v1 -> v2: deliveries gains a per-channel column. The UNIQUE constraint
+    changed too, which SQLite cannot alter in place, so the table is rebuilt.
+    Pre-v2 rows carry channel '' and stay delivered.
+
+    v2 -> v3: switches gains a nullable owner_pwhash for the web panel.
+    Nullable is deliberate: an existing switch has no password yet, so the
+    panel refuses it until an owner sets one. Fail-closed, never open.
     """
-    if "channel" in _columns(conn, "deliveries"):
-        return
-    conn.executescript(
-        """
+    if "channel" not in _columns(conn, "deliveries"):
+        conn.executescript(
+            """
         BEGIN IMMEDIATE;
         ALTER TABLE deliveries RENAME TO deliveries_v1;
         CREATE TABLE deliveries (
@@ -176,7 +186,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         DROP TABLE deliveries_v1;
         COMMIT;
         """
-    )
+        )
+    if "owner_pwhash" not in _columns(conn, "switches"):
+        conn.execute("ALTER TABLE switches ADD COLUMN owner_pwhash TEXT")
+
+
+def set_owner_pwhash(conn: sqlite3.Connection, switch_id: str, encoded: str | None) -> None:
+    conn.execute("UPDATE switches SET owner_pwhash=? WHERE id=?", (encoded, switch_id))
+
+
+def get_owner_pwhash(conn: sqlite3.Connection, switch_id: str) -> str | None:
+    row = conn.execute("SELECT owner_pwhash FROM switches WHERE id=?", (switch_id,)).fetchone()
+    if row is None or row["owner_pwhash"] in (None, ""):
+        return None
+    return row["owner_pwhash"]
 
 
 class tx:

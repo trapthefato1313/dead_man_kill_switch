@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: listmonk
+      POSTGRES_PASSWORD: ${LISTMONK_DB_PASSWORD}
+      POSTGRES_DB: listmonk
+    volumes:
+      - listmonk-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U listmonk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  listmonk:
+    image: listmonk/listmonk:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"   # so local; expoe por reverse-proxy/TLS
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["./listmonk", "--config", "config.toml"]
+    volumes:
+      - ./config.toml:/listmonk/config.toml
+      - ./uploads:/listmonk/uploads
+
+volumes:
+  listmonk-db:
